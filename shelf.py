@@ -10,6 +10,8 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import HTTPException
 
+from txt2epub import txt_to_epub
+
 load_dotenv()
 
 OWNER = os.environ["GH_OWNER"]
@@ -179,6 +181,12 @@ async def publish_upload(filename: str, data: bytes, title: str) -> dict:
         raise HTTPException(400, f"Only {', '.join(MIME)} files are allowed")
     if len(data) > MAX_BYTES:
         raise HTTPException(413, f"File is larger than {MAX_BYTES // (1024 * 1024)} MB")
+
+    # E-ink readers like the Xteink skip .txt entries, so publish those as EPUB.
+    if ext == ".txt":
+        stem = os.path.splitext(name)[0]
+        data = txt_to_epub(data, title.strip() or stem.replace("_", " "))
+        name, ext = f"{stem}.epub", ".epub"
 
     parent = await head_sha()
     catalog = add_entry(await read_catalog(parent), title.strip() or name, name, MIME[ext])

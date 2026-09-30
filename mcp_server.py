@@ -45,7 +45,8 @@ mcp = FastMCP(
         "book the user attached: call create_upload_link, then run the returned "
         "curl command in your own sandbox to send the file. If the book is "
         "available at a public http(s) URL, call add_book_from_url instead. "
-        "Allowed types are .epub, .txt, and .xtc. "
+        "Allowed types are .epub, .txt, and .xtc. A .txt file is converted to "
+        ".epub automatically before it is published. "
         "remove_book deletes a catalog entry by the id from list_books and, when "
         "the file lives in the uploads folder, deletes that file too."
     ),
