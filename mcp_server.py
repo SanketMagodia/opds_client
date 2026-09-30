@@ -88,8 +88,26 @@ async def add_book(
         Field(description="Title to show in the catalog. Empty uses the file name."),
     ] = "",
 ) -> dict:
-    """Upload a local book file and add it to the OPDS catalog."""
+    """Add a book file to the OPDS catalog.
+
+    If the server is remote, this returns a curl command to run where the file lives.
+    """
     raw = file_path.strip().strip('"').strip("'")
+    if ON_VERCEL:
+        # The path is on the caller's machine, not ours. Hand back a command that
+        # sends the file here, so clients with a stale tool list still succeed.
+        link = await create_upload_link(Path(raw).name, title)
+        if not link["ok"]:
+            return link
+        return {
+            "ok": False,
+            "error": (
+                "This server cannot read files from your machine. Run the command "
+                "below where the file lives to upload it, then call list_books."
+            ),
+            "run_this": f'curl -sS -F "file=@{raw}" "{link["upload_url"]}"',
+            "expires_in_seconds": link["expires_in_seconds"],
+        }
     path = Path(raw).expanduser()
     if not path.is_file():
         return {"ok": False, "error": f"No file at {path}"}
@@ -99,10 +117,8 @@ async def add_book(
         return _fail(exc)
 
 
-# A local path only means something when the server runs on your own machine.
-# On Vercel the tool just misleads clients into sending sandbox paths.
-if not ON_VERCEL:
-    mcp.tool()(add_book)
+# Kept on Vercel too: clients that cached the old tool list keep calling it.
+mcp.tool()(add_book)
 
 
 @mcp.tool()
