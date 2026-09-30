@@ -2,3 +2,5 @@ fastapi
 uvicorn[standard]
 httpx
 python-multipart
+python-dotenv
+mcp==1.27.0
