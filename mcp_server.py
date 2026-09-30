@@ -7,12 +7,18 @@ Locally, `python main.py` or `python mcp_server.py` starts both the website
 and /mcp on one port.
 """
 
+import base64
+import hashlib
+import hmac
+import json
 import os
 import secrets
+import time
 from pathlib import Path
 from typing import Annotated
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, unquote, urlparse
 
+import httpx
 from fastapi import HTTPException
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -22,20 +28,24 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from shelf import list_items, publish_upload, remove_upload
+from shelf import MAX_BYTES, list_items, publish_upload, remove_upload
 
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8000"))
+ON_VERCEL = bool(os.getenv("VERCEL"))
+UPLOAD_LINK_TTL = 15 * 60
 
 mcp = FastMCP(
     "Shelf",
     instructions=(
         "Personal OPDS bookshelf stored in a GitHub repository. "
         "list_books shows the catalog. "
-        "add_book uploads a .epub, .txt, or .xtc file that already exists on the "
-        "machine running this server (pass its full path) and updates catalog.xml "
-        "in the same commit. On Vercel there is no local disk of books, so add "
-        "files through the website uploader instead. "
+        "This server runs on a different machine than you, so it cannot open "
+        "file paths from your sandbox or the user's chat attachments. To add a "
+        "book the user attached: call create_upload_link, then run the returned "
+        "curl command in your own sandbox to send the file. If the book is "
+        "available at a public http(s) URL, call add_book_from_url instead. "
+        "Allowed types are .epub, .txt, and .xtc. "
         "remove_book deletes a catalog entry by the id from list_books and, when "
         "the file lives in the uploads folder, deletes that file too."
     ),
@@ -68,7 +78,6 @@ async def list_books() -> dict:
         return _fail(exc)
 
 
-@mcp.tool()
 async def add_book(
     file_path: Annotated[
         str,
@@ -88,6 +97,140 @@ async def add_book(
         return await publish_upload(path.name, path.read_bytes(), title)
     except HTTPException as exc:
         return _fail(exc)
+
+
+# A local path only means something when the server runs on your own machine.
+# On Vercel the tool just misleads clients into sending sandbox paths.
+if not ON_VERCEL:
+    mcp.tool()(add_book)
+
+
+@mcp.tool()
+async def add_book_from_url(
+    url: Annotated[str, Field(description="Public http(s) URL of a .epub, .txt, or .xtc file.")],
+    title: Annotated[
+        str,
+        Field(description="Title to show in the catalog. Empty uses the file name."),
+    ] = "",
+    filename: Annotated[
+        str,
+        Field(description="File name to store it as. Empty uses the last part of the URL."),
+    ] = "",
+) -> dict:
+    """Download a book from a public URL and add it to the OPDS catalog."""
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in ("http", "https"):
+        return {"ok": False, "error": "URL must start with http:// or https://"}
+    name = filename.strip() or unquote(Path(parsed.path).name)
+    chunks, size = [], 0
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60) as c:
+            async with c.stream("GET", url.strip()) as r:
+                if r.status_code >= 400:
+                    return {"ok": False, "error": f"Download failed: HTTP {r.status_code}"}
+                async for chunk in r.aiter_bytes():
+                    size += len(chunk)
+                    if size > MAX_BYTES:
+                        return {
+                            "ok": False,
+                            "error": f"File is larger than {MAX_BYTES // (1024 * 1024)} MB",
+                        }
+                    chunks.append(chunk)
+    except httpx.HTTPError as exc:
+        return {"ok": False, "error": f"Download failed: {exc}"}
+    try:
+        return await publish_upload(name, b"".join(chunks), title)
+    except HTTPException as exc:
+        return _fail(exc)
+
+
+@mcp.tool()
+async def create_upload_link(
+    filename: Annotated[
+        str,
+        Field(description="File name to store, such as Alice.epub. Must end in .epub, .txt, or .xtc."),
+    ],
+    title: Annotated[
+        str,
+        Field(description="Title to show in the catalog. Empty uses the file name."),
+    ] = "",
+) -> dict:
+    """Get a one-time upload URL for sending a book file from your own sandbox.
+
+    Run the returned curl command where the file lives. The link expires in 15 minutes.
+    """
+    if not os.getenv("MCP_TOKEN", "").strip():
+        return {"ok": False, "error": "MCP_TOKEN is not set on the server"}
+    name = Path(filename.strip().strip('"').strip("'")).name
+    url = f"{public_base_url()}/upload/{make_upload_token(name, title.strip())}"
+    return {
+        "ok": True,
+        "upload_url": url,
+        "expires_in_seconds": UPLOAD_LINK_TTL,
+        "max_mb": MAX_BYTES // (1024 * 1024),
+        "curl": f'curl -sS -F "file=@<path to {name}>" "{url}"',
+    }
+
+
+def public_base_url() -> str:
+    explicit = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
+    if explicit:
+        return explicit
+    # Set automatically by Vercel, without the scheme.
+    host = os.getenv("VERCEL_PROJECT_PRODUCTION_URL") or os.getenv("VERCEL_URL")
+    if host:
+        return f"https://{host}"
+    return f"http://{HOST}:{PORT}"
+
+
+def _b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+def _sign(body: str) -> str:
+    key = os.getenv("MCP_TOKEN", "").strip().encode()
+    return _b64(hmac.new(key, b"upload:" + body.encode(), hashlib.sha256).digest())
+
+
+def make_upload_token(filename: str, title: str) -> str:
+    claims = {"f": filename, "t": title, "e": int(time.time()) + UPLOAD_LINK_TTL}
+    body = _b64(json.dumps(claims, separators=(",", ":")).encode())
+    return f"{body}.{_sign(body)}"
+
+
+def read_upload_token(token: str) -> dict | None:
+    if not os.getenv("MCP_TOKEN", "").strip() or "." not in token:
+        return None
+    body, sig = token.rsplit(".", 1)
+    if not secrets.compare_digest(sig, _sign(body)):
+        return None
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+    except ValueError:
+        return None
+    if claims.get("e", 0) < time.time():
+        return None
+    return claims
+
+
+async def upload_with_link(request: Request) -> JSONResponse:
+    """Receive a file for a link made by create_upload_link. Multipart or raw body."""
+    claims = read_upload_token(request.path_params["token"])
+    if claims is None:
+        return JSONResponse({"ok": False, "error": "Upload link is invalid or expired"}, 401)
+    if request.headers.get("content-type", "").startswith("multipart/form-data"):
+        form = await request.form()
+        upload = form.get("file")
+        if upload is None or isinstance(upload, str):
+            return JSONResponse({"ok": False, "error": "Send the book in a 'file' field"}, 400)
+        data = await upload.read()
+    else:
+        data = await request.body()
+    try:
+        result = await publish_upload(claims["f"], data, claims["t"])
+    except HTTPException as exc:
+        return JSONResponse({"ok": False, "error": str(exc.detail)}, exc.status_code)
+    return JSONResponse(result)
 
 
 @mcp.tool()
@@ -165,6 +308,8 @@ def install_mcp(app) -> None:
     inner = mcp.streamable_http_app()
     stream = next(route.endpoint for route in inner.routes if getattr(route, "path", None) == "/")
     app.router.routes.append(Route("/mcp", endpoint=BearerGate(stream, token)))
+    # Public route: the signed link itself is the credential.
+    app.router.routes.append(Route("/upload/{token}", upload_with_link, methods=["POST", "PUT"]))
     app.mount("/mcp", BearerGate(inner, token))
 
 
